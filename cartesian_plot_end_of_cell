@@ -1,0 +1,342 @@
+# %% Import libraries and functions
+import contrast as contrast
+import velocity as velocity
+import cupy as cp
+import matplotlib.pyplot as plt
+import numpy as np
+from NLSE import NLSE
+from scipy import signal, optimize
+from cycler import cycler
+from scipy.constants import c, epsilon_0
+from skimage import restoration
+from matplotlib import colors
+from PIL import Image
+from matplotlib.ticker import FuncFormatter
+import scipy.ndimage as ndi
+from scipy.integrate import solve_ivp
+from PyQt5 import QtWidgets
+from matplotlib import animation
+from IPython.display import HTML
+import matplotlib.ticker as ticker
+from tqdm import tqdm
+import numba
+import os
+
+ell = 1 #vortex charge
+emm = 2 # m for e^im\theta mode -- TO ADD TO E1
+k = 111 #plane wave frequency -- TO ADD TO E1
+N = 2048 
+window = 20e-3 #15e-3 #window in meters, ideally >> waist size, otherwise reflective effects due to fft arise, 
+                      # use absorbing boundaries by adding to NLSE(..., absorption_width = 0.3*window) and renaming the nlse_absorbing_boundaries.py file nlse.py 
+p = N/window #pixel size (to get real units, need to mulitply by pixel size)
+L_cm = 21 #length of the cell in cm
+L = L_cm * 1e-2 #length of the cell in meters
+noise_amp = 0 #0.01 #0.001
+zoom = 300 #pixel shown will be zoom*2 around the center
+xi = 17e-6 #healing length in meters
+T = 0.07
+alpha = -np.log(T) / L #attenuation coefficient
+# %% Inputs
+n20 = -9.5e-11
+Isat0 = 6e5
+waist = 1.7e-3
+d_real = 2 * 3.15e-6
+puiss = 3.2
+I0 = 2 * puiss / (np.pi * waist**2)
+n2 = n20
+Isat = Isat0  # saturation intensity in W/m^2
+k0 = 2 * np.pi / 780e-9 #m-1
+nl_lenght = 0
+
+exponent = 2
+mach = 0.0
+
+pdist = 2 * xi
+ddist = 8 * xi
+pos = np.array([-250e-6, 0])
+position = 4
+
+pos_array = np.zeros((N, N))
+
+def Vortex(XX, YY, pos=(0, 0), xi=xi, ell=ell):
+    YY = cp.asarray(simu.YY) + pos[1]
+    XX = cp.asarray(simu.XX) + pos[0]
+    r = cp.hypot(YY, XX)
+    theta = cp.arctan2(YY, XX)
+    Psi = r / cp.sqrt(r**2 + (xi / 0.83) ** 2) * cp.exp(1j * ell * theta)
+    Amp = cp.abs(Psi)
+    Phase = cp.angle(Psi)
+    return Amp, Phase
+
+def callback_sample_1(
+    simu: NLSE,
+    A: np.ndarray,
+    z: float,
+    i: int,
+    E_samples: np.ndarray,
+    z_samples: np.ndarray,
+) -> None:
+    if i % save_every == 0:
+        E_samples[i // save_every] = A
+        z_samples[i // save_every] = z
+
+
+def callback_sample_2(
+    simu: NLSE,
+    A: np.ndarray,
+    z: float,
+    i: int,
+    E_samples: np.ndarray,
+    z_samples: np.ndarray,
+) -> None:
+    if i % save_every == 0:
+        rho_ref = np.abs(A.get())
+        phi_ref = np.angle(A.get())
+        threshold = 2e-2
+        mask = rho_ref < threshold * np.max(rho_ref)
+        phi_ref_masked = np.ma.array(phi_ref, mask=mask)
+        phi_ref_unwrapped = restoration.unwrap_phase(
+            phi_ref_masked, wrap_around=(True, True)
+        )
+        tau = np.abs(np.nanmax(phi_ref_unwrapped) - np.nanmin(phi_ref_unwrapped))
+        E_samples[i // save_every] = A
+        z_samples[i // save_every] = z
+        tau_samples[i // save_every] = tau
+
+
+def callback_sample_3(
+    simu: NLSE,
+    A: np.ndarray,
+    z: float,
+    i: int,
+    E_samples: np.ndarray,
+    z_samples: np.ndarray,
+    vort_rads: np.ndarray,
+) -> None:
+    import scipy.optimize as opt
+
+    def Vortex2D(mn, y_val, x_val, xi) -> np.ndarray:
+        y, x = mn
+        r = np.sqrt((x - x_val) ** 2 + (y - y_val) ** 2)
+        theta = np.arctan2(y, x)
+        Psi = r / np.sqrt(r**2 + (2 * xi) ** 2)
+        Amp = np.abs(Psi)
+        return Amp.ravel()
+
+    if i % save_every == 0:
+        rho_vort = cp.abs(A)
+        phi_flat = cp.angle(A)
+        vort = velocity.vortex_detection(phi_flat.get(), plot=False, r=1)
+        vort[:, 0] -= phi_flat.shape[-1] // 2
+        vort[:, 1] -= phi_flat.shape[-1] // 2
+        vort_select = np.logical_not(vort[:, 0] ** 2 + vort[:, 1] ** 2 > (300) ** 2)
+        vortices = vort[vort_select, :]
+        center_x = phi_flat.shape[-1] // 2 + vortices[0][0]
+        center_y = phi_flat.shape[-1] // 2 + vortices[0][1]
+        vort = cp.array([center_x, center_y])
+        window_m = 15
+        rho_zoom = rho_vort[
+            int(center_y - window_m) : int(center_y + window_m),
+            int(center_x - window_m) : int(center_x + window_m),
+        ]
+        rho_zoom = rho_zoom.get()
+        x = np.arange(rho_zoom.shape[1])
+        y = np.arange(rho_zoom.shape[0])
+        X, Y = np.meshgrid(x, y)
+        inital_guess = (window_m, window_m, 5)
+        popt, pcov = opt.curve_fit(Vortex2D, (Y, X), rho_zoom.ravel(), p0=inital_guess)
+        vortex_reshape = Vortex2D((Y, X), *popt).reshape(window_m * 2, window_m * 2)
+        vort_rad = popt[2] * d_real
+        E_samples[i // save_every] = A
+        z_samples[i // save_every] = z
+        vort_rads[i // save_every] = vort_rad
+
+# %% Initialize simulation
+LL = L
+
+simu = NLSE(
+    alpha,
+    power=puiss, #was puiss = puiss but got TypeError: NLSE.__init__() got an unexpected keyword argument 'puiss'
+    window=window,
+    n2=n2,
+    V=None,
+    L=LL,
+    NX=N,
+    NY=N,
+    nl_length=nl_lenght,
+)
+simu.delta_z = 1e-4
+simu.n2 = n2
+simu.I_sat = Isat
+
+N_samples = 3 #L_cm
+z_samples = cp.zeros(N_samples + 1)  # +1 to account for the 0th step 
+qs_samples = cp.zeros((N_samples + 1, 2, 2))
+tau_samples = cp.zeros(N_samples + 1)
+vort_rads = cp.zeros(N_samples + 1)
+E0_samples = cp.zeros((N_samples + 1, N, N), dtype=np.complex64)
+Evort_samples = cp.zeros((N_samples + 1, N, N), dtype=np.complex64)
+E_samples = cp.zeros((N_samples + 1, N, N), dtype=np.complex64)
+N_steps = int(round(LL / simu.delta_z))
+save_every = N_steps // N_samples
+
+# %% Compute background field
+
+E0 = (
+    cp.exp(
+        -(cp.asarray(simu.XX) ** exponent + cp.asarray(simu.YY) ** exponent)
+        / waist**exponent
+    )
+    + 1j * 0
+)
+
+noise_amp = 0 #0.01
+E0 += cp.random.normal(0, noise_amp / 2, E0.shape) + 1j * cp.random.normal(
+    0, noise_amp / 2, E0.shape   ) #add noise 
+
+#fig, ax = plt.subplots(1, 2, figsize=(15, 5), layout="constrained")
+#ax[0].imshow(np.abs(E0.get()) ** 2, cmap="inferno")
+#ax[1].imshow(np.angle(E0.get()), cmap="twilight_shifted")
+#plt.show()
+
+#print(f"Simulating E0 with {N_samples} samples...")
+
+E_background = simu.out_field(
+    E0,
+    LL,
+    callback=callback_sample_2,
+    callback_args=(E0_samples, z_samples),
+    plot=False,
+    precision="single",
+)
+
+rho_ref_samples = np.abs(E0_samples.get()) ** 2
+rho_max = np.nanmax(rho_ref_samples[0])
+rho_ref_samples = rho_ref_samples / rho_max * I0
+phi_ref_samples = np.angle(E0_samples.get())
+
+# %% Compute field
+amp, phase = Vortex(simu.XX, simu.YY, ell=ell, xi=xi)
+
+N_loops = 2
+print(f'Number of loops: {N_loops}')
+for i in range(1, N_loops, 1): #loop over many frequencies
+    k  = 100 #k0 / (51.02 * i)
+    E1 = E0.copy()
+    E1 *= 0.9*amp
+    E1 *= cp.exp(1j * phase)
+    #E1 += 0.1 * cp.exp(1j * k * cp.asarray(simu.YY)) #we take 10% as a plane wave 
+    E1 += 0.1 * cp.exp(1j * emm * cp.arctan2(cp.asarray(simu.YY),cp.asarray(simu.XX)))
+
+    print(f"Simulating E with {N_samples} samples..., loop {i}")
+    E = simu.out_field(
+        E1,
+        LL,
+        callback=callback_sample_1,
+        callback_args=(E_samples, z_samples),
+        plot=False,
+        precision="single",
+        normalize=True,
+    )
+
+    def fmt(x, pos) -> str:
+        a, b = "{:.0e}".format(x).split("e")
+        b = int(b)
+        return r"${} \times 10^{{{}}}$".format(a, b)
+
+    E_samples_1 = E_samples[
+        :,
+        E_samples.shape[-1] // 2 - zoom : E_samples.shape[-1] // 2 + zoom,
+        E_samples.shape[-1] // 2 - zoom : E_samples.shape[-1] // 2 + zoom,
+    ]
+    E_samples_0 = E0_samples[
+        :,
+        E0_samples.shape[-1] // 2 - zoom : E0_samples.shape[-1] // 2 + zoom,
+        E0_samples.shape[-1] // 2 - zoom : E0_samples.shape[-1] // 2 + zoom,
+    ]
+
+    E_samples_0 = E_samples_0.get()[-1, :, :] #background at L = 20 cm only
+    E_samples_1 = E_samples_1.get()[-1, :, :] #background + data at L = 20 cm only 
+
+    base_path = "MarcY_Leon/DATA/Atoms/2025/Multicharge/Simulations/0120_multi_freq"
+
+    # Construct the folder name dynamically
+    folder_name = f"k{np.round(k, 2)}_l{ell}"
+
+    # Combine the base path and folder name
+    full_path = os.path.join(base_path, folder_name)
+
+    # Create the folder
+    os.makedirs(full_path, exist_ok=True) 
+
+    #np.save(f"MarcY_Leon/DATA/Atoms/2025/Multicharge/Simulations/0120_multi_freq/k{np.round(k,2)}_l{ell}/k{np.round(k,2)}_l{ell}_backg_and_data.npy",   E_samples_1 )
+
+    #np.save(f"MarcY_Leon/DATA/Atoms/2025/Multicharge/Simulations/0120_multi_freq/k{np.round(k,2)}_l{ell}/k{np.round(k,2)}_l{ell}_backg_only.npy",   E_samples_0  )   
+
+    rho1 = np.abs(E_samples_1) ** 2
+    phi1 = np.angle(E_samples_1)
+    rho0 = np.abs(E_samples_0) ** 2
+    phi0 = np.angle(E_samples_0)
+    phi = np.angle(E_samples_1/E_samples_0)  #to remove backgrnd (gaussian)
+    rho = rho1 - rho0                        #to remove backgrnd (gaussian)
+    
+    #normalization
+
+    #rho_min = np.min(rho)
+    #rho_max = np.max(rho)
+    #if rho_max > rho_min:  # Avoid division by zero
+       #rho = (rho - rho_min) / (rho_max - rho_min)
+    #else:
+        #rho = np.zeros_like(rho)  # All values are the same, set to zero
+
+
+# Define font sizes for all elements
+    label_fontsize      = 20
+    title_fontsize      = 22
+    tick_fontsize       = 16
+    cbar_label_fontsize = 18
+    cbar_tick_fontsize  = 16
+
+    # Create figure and axes
+    fig, ax = plt.subplots(1, 2, figsize=(15, 5), dpi=800, gridspec_kw={'wspace': 0.13})
+    fig.suptitle(rf"$m={emm}, \ell = {ell}$ ", fontsize=title_fontsize)
+    # Plot intensity image
+    im0 = ax[0].imshow(rho, cmap="RdGy", interpolation="none")
+    ticks = np.linspace(np.nanmin(rho), np.nanmax(rho), 3)
+    cbar0 = fig.colorbar(im0, ax=ax[0], label="Intensity", format=ticker.FuncFormatter(fmt), shrink=0.6, ticks=ticks)
+    cbar0.ax.tick_params(labelsize=cbar_tick_fontsize)
+    cbar0.set_label("Intensity", fontsize=cbar_label_fontsize)
+
+    # Plot phase image
+    im1 = ax[1].imshow(phi, cmap="twilight_shifted", interpolation="none")
+    cbar1 = fig.colorbar(im1, ax=ax[1], label="Phase", shrink=0.6,ticks=[-np.pi/2,0, np.pi/2])
+
+    # Formatter for phase colorbar ticks to display in terms of π
+    def pi_formatter(x, pos):
+        if np.isclose(x, 0):
+            return "0"
+        else:
+            n = x / np.pi
+            if np.isclose(n, 1):
+                return r"$\pi$"
+            elif np.isclose(n, -1):
+                return r"$-\pi$"
+            else:
+                return r"${:.1f}\pi$".format(n)
+
+    cbar1.ax.yaxis.set_major_formatter(FuncFormatter(pi_formatter))
+    cbar1.ax.tick_params(labelsize=cbar_tick_fontsize)
+    cbar1.set_label("Phase", fontsize=cbar_label_fontsize)
+
+    ax[0].set_title(f"Intensity at z={L_cm} cm", fontsize=title_fontsize)
+    ax[1].set_title(f"Phase at z={L_cm} cm", fontsize=title_fontsize)
+
+    # Increase tick label sizes for both subplots
+    for a in ax:
+        a.tick_params(axis='both', which='major', labelsize=tick_fontsize)
+    #plt.savefig(f"MarcY_Leon/DATA/Atoms/2025/Multicharge/Simulations/0120_multi_freq/k{np.round(k,2)}_l{ell}/k{np.round(k,2)}_l{ell}_no_planewave_refl.svg", dpi=800)
+    plt.savefig(f"MarcY_Leon/DATA/Atoms/2025/Multicharge/Simulations/m{emm}_l{ell}_10cm.pdf", dpi=800)
+    plt.close()
+    print(f'Done loop {i}')
+
+print('Done')

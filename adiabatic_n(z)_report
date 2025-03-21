@@ -1,0 +1,463 @@
+# %% Import libraries and functions
+
+from __future__ import absolute_import
+from __future__ import division
+from __future__ import print_function
+from __future__ import unicode_literals
+
+import contrast as contrast
+import velocity as velocity
+import cupy as cp
+cp.cuda.runtime.setDevice(0)
+print(f"Using GPU: {cp.cuda.Device()}")
+import matplotlib.pyplot as plt
+import numpy as np
+from NLSE import NLSE
+from scipy import signal, optimize
+from cycler import cycler
+from scipy.constants import c, epsilon_0
+from skimage import restoration
+from matplotlib import colors
+from PIL import Image
+import scipy.ndimage as ndi
+from scipy.integrate import solve_ivp
+from PyQt5 import QtWidgets
+from matplotlib import animation
+from IPython.display import HTML
+import matplotlib.ticker as ticker
+from tqdm import tqdm
+import numba
+import os
+from scipy.ndimage import map_coordinates
+import matplotlib.cm as cm
+ell = 3
+L_cm = 21
+xi = 17e-6
+function  ='exp_ramp' # 'sigmoid', 'gaussian', 'double_sigmoid', 'exp_ramp', 'sinusoidal, 'linear', 'quartic' or 'tanh'
+print(f'l={ell}')
+
+base_path = "MarcY_Leon/DATA/Atoms/2025/Multicharge/Simulations/0218_multi_adiabatic_n"
+
+# Construct the folder name dynamically
+folder_name = f"l{ell}"
+
+# Combine the base path and folder name
+full_path = os.path.join(base_path, folder_name)
+
+# Create the folder
+os.makedirs(full_path, exist_ok=True) 
+
+def cartesian_to_polar(image, origin=None, dr=1, dt=None):
+    """
+    Converts a Cartesian image to polar coordinates.
+    """
+    ny, nx = image.shape
+    if origin is None:
+        origin = (ny // 2, nx // 2)
+
+    # Create Cartesian coordinate grids
+    x, y = np.meshgrid(np.arange(nx) - origin[1], np.arange(ny) - origin[0])
+    r, theta = np.hypot(x, y), np.arctan2(y, x)
+
+    # Define the polar grid resolution
+    nr = int(np.ceil(r.max() / dr))
+    if dt is None:
+        nt = max(nx, ny)
+    else:
+        nt = int(np.ceil((2 * np.pi) / dt))
+
+    r_i = np.linspace(0, r.max(), nr)
+    theta_i = np.linspace(-np.pi, np.pi, nt)
+    theta_grid, r_grid = np.meshgrid(theta_i, r_i)
+
+    # Convert polar grid to Cartesian indices
+    X_cart, Y_cart = r_grid * np.cos(theta_grid), r_grid * np.sin(theta_grid)
+    row_idx = origin[0] + Y_cart
+    col_idx = origin[1] + X_cart
+    coords = np.vstack((row_idx.ravel(), col_idx.ravel()))
+
+    # Interpolate intensity values onto the polar grid
+    polar_image = map_coordinates(image, coords, order=1, mode='nearest').reshape(nr, nt)
+
+    return polar_image, r_grid, theta_grid
+    
+
+def Vortex(XX, YY, pos=(0, 0), xi=xi, ell=ell):
+    YY = cp.asarray(simu.YY) + pos[1]
+    XX = cp.asarray(simu.XX) + pos[0]
+    r = cp.hypot(YY, XX)
+    theta = cp.arctan2(YY, XX)
+    Psi = r / cp.sqrt(r**2 + (xi / 0.83) ** 2) * cp.exp(1j * ell * theta)
+    Amp = cp.abs(Psi)
+    Phase = cp.angle(Psi)
+    return Amp, Phase
+
+def callback_sample_1(
+    simu: NLSE,
+    A: np.ndarray,
+    z: float,
+    i: int,
+    E_samples: np.ndarray,
+    z_samples: np.ndarray,
+) -> None:
+    if i % save_every == 0:
+        E_samples[i // save_every] = A
+        z_samples[i // save_every] = z
+
+
+def callback_sample_2(
+    simu: NLSE,
+    A: np.ndarray,
+    z: float,
+    i: int,
+    E_samples: np.ndarray,
+    z_samples: np.ndarray,
+) -> None:
+    if i % save_every == 0:
+        rho_ref = np.abs(A.get())
+        phi_ref = np.angle(A.get())
+        threshold = 2e-2
+        mask = rho_ref < threshold * np.max(rho_ref)
+        phi_ref_masked = np.ma.array(phi_ref, mask=mask)
+        phi_ref_unwrapped = restoration.unwrap_phase(
+            phi_ref_masked, wrap_around=(True, True)
+        )
+
+        tau = np.abs(np.nanmax(phi_ref_unwrapped) - np.nanmin(phi_ref_unwrapped))
+        E_samples[i // save_every] = A
+        z_samples[i // save_every] = z
+        tau_samples[i // save_every] = tau
+def callback_sample_n2_adiabatic(
+    simu: NLSE,
+    A: np.ndarray,
+    z: float,
+    i: int,
+    E_samples: np.ndarray,
+    z_samples: np.ndarray,
+    n2_samples: np.ndarray,  
+) -> None:
+    
+    # Force z to update correctly
+    if i > 0:
+        z = z_samples[i - 1] + simu.delta_z
+    else:
+        z = 0  # Initial step
+    
+    z_samples[i] = z  # Store updated z
+    s = 10  
+    n2_start = 1e-11  # Starting value
+    n2_end = -1e-9  # Ending value
+
+    if function == 'sigmoid':
+        n2_new = n2_end + (n2_start - n2_end) * (1 / (1 + np.exp(-s * (z - L / 2))))
+
+    elif function == 'linear':
+        n2_new = n2_start + (n2_end - n2_start) * (z / L)  
+
+    elif function == 'tanh':
+        n2_new = n2_end + (n2_start - n2_end) * (np.tanh(s * (z / L - 0.5)) + 1) / 2  
+
+    elif function == 'quartic':
+        n2_new = n2_start + (n2_end - n2_start) * (z / L) ** 4
+
+    elif function == 'gaussian':
+        sigma = L / 3  # Width of the Gaussian ramp
+        n2_new = n2_end + (n2_start - n2_end) * np.exp(-((z - L / 2) ** 2) / (2 * sigma ** 2))
+
+    elif function == 'double_sigmoid':
+        s1, s2 = 5, 1  # Different steepness values for two sigmoid parts
+        n2_new = n2_end + (n2_start - n2_end) * (1 / (1 + np.exp(-s1 * (z - L / 3)))) * (1 / (1 + np.exp(s2 * (z - 2 * L / 3))))
+
+    elif function == 'sinusoidal':
+        n2_new = n2_start + (n2_end - n2_start) * (1 - np.cos(np.pi * z / L)) / 2
+
+    elif function == 'exp_ramp':
+        tau = L / 2  # Characteristic transition length
+        n2_new = n2_end + (n2_start - n2_end) * np.exp(-z / tau)
+
+
+    # Apply the updated `n2`
+    simu.n2 = n2_new  
+    n2_samples[i] = n2_new  # Store updated n2
+
+    # Debugging print statement to check values
+    #if i % (N_steps // 10) == 0:  # Print every 10% of the simulation
+        #print(f"Step {i}: z = {z:.4f} m, n2 = {n2_new:.5e}, simu.n2 = {simu.n2:.5e}")
+
+    # Store only at `save_every` steps
+    if i % save_every == 0:
+        E_samples[i // save_every] = A
+
+
+
+#create a callback for background 
+       
+# %% Inputs
+n20 = -9.5e-11
+Isat0 = 6e5
+waist = 1.7e-3
+
+N = 2048
+window = 15e-3
+d_real = 2 * 3.15e-6
+puiss = 3.2
+I0 = 2 * puiss / (np.pi * waist**2)
+n2 = n20
+Isat = Isat0  # saturation intensity in W/m^2
+k0 = 2 * np.pi / 780e-9 #m-1
+L = L_cm * 1e-2
+T = 0.07
+alpha = -np.log(T) / L
+nl_lenght = 0
+
+exponent = 2
+mach = 0.0
+xi = 10e-6
+
+pdist = 2 * xi
+ddist = 8 * xi
+pos = np.array([-250e-6, 0])
+zoom = 300
+position = 4
+
+pos_array = np.zeros((N, N))
+
+# %% Initialize simulation
+LL = L
+
+simu = NLSE(
+    alpha,
+    power=puiss, #was puiss = puiss but got TypeError: NLSE.__init__() got an unexpected keyword argument 'puiss'
+    window=window,
+    n2=n20, #n2
+    V=None,
+    L=LL,
+    NX=N,
+    NY=N,
+    nl_length=nl_lenght,
+)
+simu.delta_z = 1e-4
+#simu.n2 = n2
+simu.I_sat = Isat
+
+N_samples = L_cm 
+
+N_steps = int(round(LL / simu.delta_z))  # Total number of steps
+n2_samples = cp.zeros(N_steps + 1)  # Array to store n2 values
+#z_samples = cp.zeros(N_samples + 1) 
+z_samples = cp.linspace(0, LL, N_steps + 1)  # ✅ Ensure correct z values
+
+
+qs_samples = cp.zeros((N_samples + 1, 2, 2))
+tau_samples = cp.zeros(N_samples + 1)
+vort_rads = cp.zeros(N_samples + 1)
+E0_samples = cp.zeros((N_samples + 1, N, N), dtype=np.complex64)
+Evort_samples = cp.zeros((N_samples + 1, N, N), dtype=np.complex64)
+E_samples = cp.zeros((N_samples + 1, N, N), dtype=np.complex64)
+save_every = N_steps // N_samples
+
+# %% Compute background field
+
+E0 = (
+    cp.exp(
+        -(cp.asarray(simu.XX) ** exponent + cp.asarray(simu.YY) ** exponent)
+        / waist**exponent)
+    + 1j * 0
+)
+
+noise_amp = 0
+E0 += cp.random.normal(0, noise_amp / 2, E0.shape) + 1j * cp.random.normal(
+    0, noise_amp / 2, E0.shape   ) #add noise 
+
+E_background = simu.out_field(
+    E0,
+    LL,
+    callback= callback_sample_2,
+    callback_args=(E0_samples, z_samples),
+    plot=False,
+    precision="single",
+)
+
+# %% Compute field
+amp, phase = Vortex(simu.XX, simu.YY, ell=ell, xi=xi)
+
+E1 = E0.copy()
+E1 *= amp #0.9 * amp
+E1 *= cp.exp(1j * phase)
+#E1 += 0.1 * cp.exp(1j * k * cp.asarray(simu.YY)) #we take 10% as a plane wave 
+
+print(f"Simulating E with {N_samples} samples...")
+
+
+E = simu.out_field(
+    E1,
+    LL,
+    callback=callback_sample_1,
+    callback_args=(E_samples, z_samples),
+    plot=False,
+    precision="single",
+    normalize=True,
+)
+
+
+def fmt(x, pos) -> str:
+    a, b = "{:.0e}".format(x).split("e")
+    b = int(b)
+    return r"${} \times 10^{{{}}}$".format(a, b)
+
+
+E_samples_11 = E_samples[
+    :,
+    E_samples.shape[-1] // 2 - zoom : E_samples.shape[-1] // 2 + zoom,
+    E_samples.shape[-1] // 2 - zoom : E_samples.shape[-1] // 2 + zoom,
+]
+E_samples_00 = E0_samples[
+    :,
+    E0_samples.shape[-1] // 2 - zoom : E0_samples.shape[-1] // 2 + zoom,
+    E0_samples.shape[-1] // 2 - zoom : E0_samples.shape[-1] // 2 + zoom,
+] 
+from matplotlib.ticker import FuncFormatter
+for zzz in range(0, 21, 1):
+
+    E_samples_0 = E_samples_00.get()[zzz, :, :] #background 
+    E_samples_1 = E_samples_11.get()[zzz, :, :] #background + data 
+
+    rho1 = np.abs(E_samples_1) ** 2
+    phi1 = np.angle(E_samples_1)
+    rho0 = np.abs(E_samples_0) ** 2
+    phi0 = np.angle(E_samples_0)
+    phi = np.angle(E_samples_1/E_samples_0)  #to remove backgrnd
+    rho = rho1 - rho0                        #to remove backgrnd
+
+    # Define font sizes for all elements
+    label_fontsize      = 20
+    title_fontsize      = 22
+    tick_fontsize       = 16
+    cbar_label_fontsize = 18
+    cbar_tick_fontsize  = 16
+
+    # Create figure and axes
+    fig, ax = plt.subplots(1, 2, figsize=(15, 5), dpi=800, gridspec_kw={'wspace': 0.07})
+
+    # Plot intensity image
+    im0 = ax[0].imshow(rho, cmap="RdGy", interpolation="none")
+    ticks = np.linspace(np.nanmin(rho), np.nanmax(rho), 3)
+    cbar0 = fig.colorbar(im0, ax=ax[0], label="Intensity", shrink=0.6, ticks=ticks)
+    cbar0.ax.tick_params(labelsize=cbar_tick_fontsize)
+    cbar0.set_label("Intensity", fontsize=cbar_label_fontsize)
+
+    # Plot phase image
+    im1 = ax[1].imshow(phi, cmap="twilight_shifted", interpolation="none")
+    cbar1 = fig.colorbar(im1, ax=ax[1], label="Phase", shrink=0.6,ticks=[-np.pi/2,0, np.pi/2])
+
+    # Formatter for phase colorbar ticks to display in terms of π
+    def pi_formatter(x, pos):
+        if np.isclose(x, 0):
+            return "0"
+        else:
+            n = x / np.pi
+            if np.isclose(n, 1):
+                return r"$\pi$"
+            elif np.isclose(n, -1):
+                return r"$-\pi$"
+            else:
+                return r"${:.1f}\pi$".format(n)
+
+    cbar1.ax.yaxis.set_major_formatter(FuncFormatter(pi_formatter))
+    cbar1.ax.tick_params(labelsize=cbar_tick_fontsize)
+    cbar1.set_label("Phase", fontsize=cbar_label_fontsize)
+
+    ax[0].set_title(f"Intensity at z={zzz} cm", fontsize=title_fontsize)
+    ax[1].set_title(f"Phase at z={zzz} cm", fontsize=title_fontsize)
+
+    # Increase tick label sizes for both subplots
+    for a in ax:
+        a.tick_params(axis='both', which='major', labelsize=tick_fontsize)
+
+    plt.savefig(f"MarcY_Leon/DATA/Atoms/2025/Multicharge/Simulations/0218_multi_adiabatic_n/l{ell}/{zzz}_{function}.svg", dpi=800)
+    plt.close()
+
+# Define values of l to compare
+l_values = [3]
+colors_map = {1: cm.Blues, 3: cm.Reds}  # Define colormaps for each l
+
+# Initialize figure
+plt.figure(figsize=(18, 15))
+
+for l in l_values:
+    # Initialize storage for different z values
+    r_values_list = []
+    intensity_differences = []
+    rescaled_r_values_list = []
+    z_values = []
+
+    E_samples0 = E_samples_00.get() #background at L = 20 cm only
+    E_samples1 = E_samples_11.get() #background + data at L = 20 cm only
+
+    # Loop over different z values
+    for zzz in [5, 20]:
+        # Convert intensity to polar coordinates
+        intensity_cartesian = np.abs(E_samples1[zzz]) ** 2
+        intensity_polar, r_grid, _ = cartesian_to_polar(intensity_cartesian)
+
+        intensity_cartesian0 = np.abs(E_samples0[zzz]) ** 2
+        intensity_polar0, r_grid0, _ = cartesian_to_polar(intensity_cartesian0)
+
+        # Compute azimuthally averaged intensity I(r)
+        I_r = np.mean(intensity_polar, axis=1)
+        I_r0 = np.mean(intensity_polar0, axis=1)
+
+        # Compute sqrt(I_r) - sqrt(I_r0)
+        sqrt_I_r = np.sqrt(I_r)
+        sqrt_I_r0 = np.sqrt(I_r0)
+        intensity_diff = sqrt_I_r - sqrt_I_r0
+
+        # Compute the healing length ξ(r)
+        #xi_r = 1 / (k0 * np.max(np.sqrt(np.abs(n2 * I_r))))
+        
+        pixel_size = d_real
+        r_grid *= pixel_size *1000  # Convert r from pixels to meters
+        r_grid0 *= pixel_size *1000  # Convert r from pixels to meters
+        # Rescale r -> r/ξ
+        rescaled_r = r_grid[:, 0] #/ xi_r
+
+        # Store values
+        r_values_list.append(r_grid[:, 0])  # Original radial values
+        rescaled_r_values_list.append(rescaled_r)  # Rescaled radial values
+        intensity_differences.append(intensity_diff)  # Store intensity differences
+        z_values.append(zzz)  # Store the corresponding z value
+
+    # Plot all stored curves on the same graph with appropriate colors
+    cmap = colors_map[l]  # Select colormap for l
+    color_values = [0.3, 0.4]  # Lighter color for z=20 (higher value = lighter color)
+    for i, z in enumerate(z_values):
+        color = cmap((i + 1) / len(z_values))  # Get color from colormap
+        #print(rescaled_r_values_list[i][:10])
+        #print(intensity_differences[i][:10])
+        plt.plot(
+            rescaled_r_values_list[i],
+            intensity_differences[i],
+            label=rf"$\ell$ = {l}, z = {z} cm",
+            color=color,
+        )
+
+
+# Labels and title
+plt.xlabel(r"$r(mm)$", fontsize=26)
+plt.ylabel(r"$\sqrt{I(r)} - \sqrt{I_0(r)}$", fontsize=26)
+plt.title("Radial Profile", fontsize=26)
+plt.xticks(fontsize=20)
+plt.yticks(fontsize=20)
+plt.legend(loc="upper right", fontsize=20)
+plt.grid(True)  # Enable grid
+plt.show()
+# Set y-axis limits
+plt.ylim(-4000, 2500)
+#plt.xlim(0, 4000)  # Set x-axis limit from 0 to 4000
+
+# Save and show the figure
+plt.savefig(f"MarcY_Leon/DATA/Atoms/2025/Multicharge/Simulations/0218_multi_adiabatic_n/l{ell}/sqrtI-sqrtI_0.png")
+plt.close()
+
+
+print('Done')

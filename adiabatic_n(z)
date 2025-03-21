@@ -1,0 +1,333 @@
+# %% Import libraries and functions
+from __future__ import absolute_import, division, print_function, unicode_literals
+import os
+import numpy as np
+import cupy as cp
+import matplotlib.pyplot as plt
+import matplotlib.cm as cm
+from NLSE import NLSE
+from scipy import signal, optimize
+from cycler import cycler
+from scipy.constants import c, epsilon_0
+from skimage import restoration
+from matplotlib import colors
+from PIL import Image
+import scipy.ndimage as ndi
+from scipy.integrate import solve_ivp
+from PyQt5 import QtWidgets
+from matplotlib import animation
+from IPython.display import HTML
+import matplotlib.ticker as ticker
+from tqdm import tqdm
+import numba
+from scipy.ndimage import map_coordinates
+xi=17e-6
+def cartesian_to_polar(image, origin=None, dr=1, dt=None):
+    """
+    Converts a Cartesian image to polar coordinates.
+    """
+    ny, nx = image.shape
+    if origin is None:
+        origin = (ny // 2, nx // 2)
+
+    x, y = np.meshgrid(np.arange(nx) - origin[1], np.arange(ny) - origin[0])
+    r, theta = np.hypot(x, y), np.arctan2(y, x)
+
+    nr = int(np.ceil(r.max() / dr))
+    if dt is None:
+        nt = max(nx, ny)
+    else:
+        nt = int(np.ceil((2 * np.pi) / dt))
+
+    r_i = np.linspace(0, r.max(), nr)
+    theta_i = np.linspace(-np.pi, np.pi, nt)
+    theta_grid, r_grid = np.meshgrid(theta_i, r_i)
+
+    X_cart, Y_cart = r_grid * np.cos(theta_grid), r_grid * np.sin(theta_grid)
+    row_idx = origin[0] + Y_cart
+    col_idx = origin[1] + X_cart
+    coords = np.vstack((row_idx.ravel(), col_idx.ravel()))
+
+    polar_image = map_coordinates(image, coords, order=1, mode='nearest').reshape(nr, nt)
+    return polar_image, r_grid, theta_grid
+
+def Vortex(XX, YY, pos=(0, 0), xi=xi, ell=1):
+    """
+    Generate a vortex amplitude and phase.
+    """
+    YY = cp.asarray(YY) + pos[1]
+    XX = cp.asarray(XX) + pos[0]
+    r = cp.hypot(YY, XX)
+    theta = cp.arctan2(YY, XX)
+    Psi = r / cp.sqrt(r**2 + (xi / 0.83) ** 2) * cp.exp(1j * ell * theta)
+    Amp = cp.abs(Psi)
+    Phase = cp.angle(Psi)
+    return Amp, Phase
+
+def callback_sample_n2_adiabatic(simu, A, z, i, E_samples, z_samples, n2_samples, ramp_function, L):
+    """
+    Callback that updates propagation distance z and sets n2 according to ramp_function.
+    Ensures n2(0)=1e-11, n2(L)=-1e-9 by mapping x=z/L from 0 to 1.
+    """
+    n2_start = 1e-11
+    n2_end   = -1e-9
+
+    if i > 0:
+        z = z_samples[i - 1] + simu.delta_z
+    else:
+        z = 0
+    z_samples[i] = z
+
+    x = z / L  # dimensionless fraction
+
+    if ramp_function == 'linear':
+        frac = x
+
+    elif ramp_function == 'quartic':
+        frac = x**4
+
+    elif ramp_function == 'quartic_sym':
+        frac = 1.0 - (1.0 - x)**4
+
+    elif ramp_function == 'sinusoidal':
+        frac = (1 - np.cos(np.pi * x)) / 2.0
+
+    elif ramp_function == 'exponential':
+        a_exp = 5.0
+        top = 1.0 - np.exp(-a_exp * x)
+        bot = 1.0 - np.exp(-a_exp)
+        frac = top / bot
+
+    elif ramp_function == 'exponential_sym':
+        a_exp = 5.0
+        # mirrored: 1 - f_exp(1-x)
+        top = np.exp(-a_exp*(1.0 - x)) - np.exp(-a_exp)
+        bot = 1.0 - np.exp(-a_exp)
+        frac = top / bot
+
+    elif ramp_function == 'tanh':
+        a_tanh = 4.0
+        top = np.tanh(a_tanh*(x - 0.5)) - np.tanh(-0.5*a_tanh)
+        bot = np.tanh(0.5*a_tanh) - np.tanh(-0.5*a_tanh)
+        frac = top / bot
+    
+    elif ramp_function == 'bottom_hat':
+        frac = 0.0 if i <= 0 else 1.0
+    
+    elif ramp_function == 'bottom_hat_smooth':
+    # Use a logistic function for a rapid, but smooth, transition.
+        k_log = 200.0   # steepness parameter; higher values make the transition sharper
+        x0 = 0.005      # center of the transition (fraction of L)
+        frac = 1.0 / (1.0 + np.exp(-k_log * (x - x0)))
+
+    n2_new = n2_start + (n2_end - n2_start)*frac
+    simu.n2 = n2_new
+    n2_samples[i] = n2_new
+    return z, n2_new
+
+
+# -- Simulation parameters
+ramp_functions = ['quartic','exponential_sym', 'sinusoidal','tanh', 'linear','exponential','quartic_sym', 'bottom_hat_smooth' , 'bottom_hat']
+
+ell = 1
+L_cm = 21
+base_path = "MarcY_Leon/DATA/Atoms/2025/Multicharge/Simulations/0218_multi_adiabatic_n"
+waist = 1.7e-3
+n20 = -9.5e-11
+Isat0 = 6e5
+N = 2048
+window = 15e-3
+d_real = 2 * 3.15e-6
+puiss = 3.2
+I0 = 2 * puiss / (np.pi * waist**2)
+Isat = Isat0
+k0 = 2 * np.pi / 780e-9
+L = L_cm * 1e-2
+T = 0.07
+alpha = -np.log(T) / L
+nl_length = 0
+exponent = 2
+mach = 0.0
+xi_value = 17e-6
+pdist = 2 * xi_value
+ddist = 8 * xi_value
+pos = np.array([-250e-6, 0])
+zoom = 700 #300
+position = 4
+
+fig, axs = plt.subplots(len(ramp_functions), 2, figsize=(16, 4 * len(ramp_functions)))
+
+# If we have only 1 function, ensure axs is 2D
+if len(ramp_functions) == 1:
+    axs = np.array([axs])
+
+# -- Main loop
+for idx, ramp in enumerate(ramp_functions):
+    print(f"Simulating for ramp function: {ramp}")
+
+    folder_name = f"l{ell}"
+    full_path = os.path.join(base_path, folder_name)
+    os.makedirs(full_path, exist_ok=True)
+
+    simu = NLSE(
+        alpha,
+        power=puiss,
+        window=window,
+        n2=n20,
+        V=None,
+        L=L,
+        NX=N,
+        NY=N,
+        nl_length=nl_length,
+    )
+    simu.delta_z = 1e-4
+    simu.I_sat = Isat
+
+    N_samples = L_cm  
+    N_steps = int(round(L / simu.delta_z))
+    n2_samples = cp.zeros(N_steps + 1)
+    z_samples = cp.linspace(0, L, N_steps + 1)
+    save_every = N_steps // N_samples
+
+    E0_samples = cp.zeros((N_samples + 1, N, N), dtype=cp.complex64)
+    E_samples  = cp.zeros((N_samples + 1, N, N), dtype=cp.complex64)
+
+    # Background field
+    E0 = cp.exp(
+        -(cp.asarray(simu.XX) ** exponent + cp.asarray(simu.YY) ** exponent) / waist**exponent
+    ) + 1j*0
+
+
+    noise_amp = 0 #0.01
+     
+    E0 += cp.random.normal(0, noise_amp/2, E0.shape) \
+        + 1j * cp.random.normal(0, noise_amp/2, E0.shape)
+
+    def callback_bg(simu, A, z, i):
+        z_new, _ = callback_sample_n2_adiabatic(
+            simu, A, z, i, E0_samples, z_samples, n2_samples, ramp, L
+        )
+        if i % save_every == 0:
+            E0_samples[i // save_every] = A
+        return z_new
+
+    E_background = simu.out_field(
+        E0,
+        L,
+        callback=callback_bg,
+        plot=False,
+        precision="single",
+    )
+
+    # Vortex field
+    amp, phase = Vortex(simu.XX, simu.YY, ell=ell, xi=17e-6)
+    E1 = E0.copy() * amp * cp.exp(1j * phase)
+
+    def callback_vortex(simu, A, z, i):
+        z_new, _ = callback_sample_n2_adiabatic(
+            simu, A, z, i, E_samples, z_samples, n2_samples, ramp, L
+        )
+        if i % save_every == 0:
+            E_samples[i // save_every] = A
+        return z_new
+
+    E_vortex = simu.out_field(
+        E1,
+        L,
+        callback=callback_vortex,
+        plot=False,
+        precision="single",
+        normalize=True,
+    )
+
+    # Bring data to CPU
+    z_vals = z_samples.get() * 1000 # change to mm 
+    n2_vals = n2_samples.get()
+    E0_cpu = E0_samples.get()
+    E_cpu  = E_samples.get()
+
+    # Crop for radial analysis
+    center = E_cpu.shape[-1] // 2
+    E0_crop = E0_cpu[:, center-zoom:center+zoom, center-zoom:center+zoom]
+    E_crop  = E_cpu[:, center-zoom:center+zoom, center-zoom:center+zoom]
+
+    # 1) Left column: n2 evolution
+    ax1 = axs[idx, 0]
+    ax1.plot(z_vals, n2_vals, linewidth=3, color="tab:orange", label=ramp)
+    ax1.set_xlabel("Propagation distance z (mm)", fontsize=22)
+    ax1.set_ylabel(r"$n_2$", fontsize=22)
+    ax1.tick_params(labelsize=16)
+    ax1.grid(True)
+
+    # 2) Right column: radial profile
+    ax2 = axs[idx, 1]
+    z_indices = [1, 5, 20]
+    for i_z, z_idx in enumerate(z_indices):
+
+        intensity_cart    = np.abs(E_crop[z_idx]) ** 2
+        intensity_cart_bg = np.abs(E0_crop[z_idx]) ** 2
+        intensity_polar, r_grid, _ = cartesian_to_polar(intensity_cart)
+        intensity_polar_bg, r_grid_bg, _ = cartesian_to_polar(intensity_cart_bg)
+
+        # Instead of taking one column, take a window of 6 columns around the middle
+        mid = intensity_polar.shape[1] // 2
+        window_size = 4
+        start = mid - window_size // 2
+        end = mid + window_size // 2 + (window_size % 2)
+
+        I_r = np.mean(intensity_polar[:, start:end], axis=1)
+        I_r_bg = np.mean(intensity_polar_bg[:, start:end], axis=1)
+
+        I_r = ((I_r- np.min(I_r))/(np.max(I_r) - np.min(I_r)))
+        I_r_bg = ((I_r_bg- np.min(I_r_bg))/(np.max(I_r_bg) - np.min(I_r_bg)))
+
+        sqrt_I_r = np.sqrt(I_r)
+        sqrt_I_r_bg = np.sqrt(I_r_bg)
+
+        intensity_diff = sqrt_I_r - sqrt_I_r_bg
+
+        pixel_size = window/N #d_real
+
+        # Multiply by 1000 to convert from meters to millimeters
+        r_values = r_grid[:, 0] * pixel_size * 1000
+
+        color = cm.Blues(0.3 + 0.4 * i_z / (len(z_indices) - 1))
+        ax2.plot(r_values, intensity_diff, linewidth=3, color=color,
+                 label=f"z = {z_idx} cm")
+
+    ax2.set_xlabel(r"$r$ (mm)", fontsize=22)
+    ax2.set_ylabel(r"$\sqrt{I}-\sqrt{I_0}$", fontsize=22)
+    #ax2.set_ylim(-5000, 4600)
+    ax2.tick_params(labelsize=16)
+    ax2.grid(True)
+
+# ----------------------------------------------------------------------
+# Create a single legend for each column after the loop
+# ----------------------------------------------------------------------
+handles_left = []
+labels_left  = []
+for idx, ramp in enumerate(ramp_functions):
+    ax1 = axs[idx, 0]
+    lines = ax1.get_lines()
+    for ln in lines:
+        handles_left.append(ln)
+        labels_left.append(ln.get_label())
+
+unique_dict_left = {}
+for h, lab in zip(handles_left, labels_left):
+    unique_dict_left[lab] = h
+handles_left = list(unique_dict_left.values())
+labels_left  = list(unique_dict_left.keys())
+
+handles_right, labels_right = axs[0, 1].get_legend_handles_labels()
+
+fig.legend(handles_right, labels_right, loc=(0.88, 0.9),
+           bbox_to_anchor=(0.88, 0.94), fontsize=14)
+fig.text(0.28, 0.95, r"$n_2$ ramp", ha="center", fontsize=24)
+fig.text(0.8, 0.95, "Radial Profile", ha="center", fontsize=24)
+
+plt.tight_layout(rect=[0, 0, 1, 0.95])
+plt.savefig(os.path.join(full_path, "combined_plots_new.svg"))
+plt.close()
+print("Done")
+
